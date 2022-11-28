@@ -1,8 +1,4 @@
-use std::{
-    borrow::{Borrow, BorrowMut},
-    fmt::{Display, Write},
-    io::{BufWriter, Read, Write as IoWriter},
-};
+use std::{fmt::Write, io::Write as IoWriter};
 
 use flate2::{
     write::{GzDecoder, GzEncoder},
@@ -10,7 +6,7 @@ use flate2::{
 };
 use thiserror::Error;
 
-use crate::INT4_NULL_CODE;
+use crate::{io::BitOutputStore, INT4_NULL_CODE};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -24,6 +20,8 @@ pub enum Error {
     Fmt(#[from] std::fmt::Error),
 }
 
+const MASK: i8 = 0xff_u8 as i8;
+
 pub trait CompressionEncoder {
     fn encode(
         &mut self,
@@ -34,7 +32,7 @@ pub trait CompressionEncoder {
     ) -> Result<Vec<i8>>;
 
     fn encode_floats(
-        &self,
+        &mut self,
         codec_index: i32,
         n_rows: i32,
         n_cols: i32,
@@ -59,6 +57,7 @@ pub trait CompressionDecoder {
 }
 
 pub trait PredictorModel {
+    #[allow(clippy::too_many_arguments)]
     fn decode(
         &self,
         seed: i32,
@@ -313,6 +312,7 @@ impl CodecM32 {
     }
 
     pub fn encode(&mut self, value: i32) {
+        #[allow(unused_assignments)]
         let mut abs_value = 0;
 
         if value < 0 {
@@ -445,17 +445,15 @@ impl Default for CodecDeflate {
 
 impl CompressionDecoder for CodecDeflate {
     fn decode(&mut self, n_rows: i32, n_columns: i32, packing: &[i8]) -> Result<Vec<i32>> {
-        let mask = 0xff_u8 as i8;
+        let seed = (packing[2] & MASK) as i32
+            | ((packing[3] & MASK) as i32) << 8
+            | ((packing[4] & MASK) as i32) << 16
+            | ((packing[5] & MASK) as i32) << 24;
 
-        let seed = (packing[2] & mask) as i32
-            | ((packing[3] & mask) as i32) << 8
-            | ((packing[4] & mask) as i32) << 16
-            | ((packing[5] & mask) as i32) << 24;
-
-        let n_m32 = (packing[6] & mask) as i32
-            | ((packing[7] & mask) as i32) << 8
-            | ((packing[8] & mask) as i32) << 16
-            | ((packing[9] & mask) as i32) << 24;
+        let n_m32 = (packing[6] & MASK) as i32
+            | ((packing[7] & MASK) as i32) << 8
+            | ((packing[8] & MASK) as i32) << 16
+            | ((packing[9] & MASK) as i32) << 24;
 
         let mut code_m32s = vec![0; n_m32 as usize];
         let mut decoder = GzDecoder::new(code_m32s);
@@ -537,15 +535,14 @@ impl CompressionDecoder for CodecDeflate {
                 .push(CodecStats::new(PredictorModelType::None));
         }
 
-        let mask = 0xff_u8 as i8;
-        let mut stats = self.codec_stats[(packing[1] & mask) as usize];
+        let mut stats = self.codec_stats[(packing[1] & MASK) as usize];
         let n_values = n_rows * n_columns;
         stats.add_to_counts((packing.len() - 10) as i32, n_values, 0);
 
-        let n_m32 = (packing[6] & mask) as i32
-            | ((packing[7] & mask) as i32) << 8
-            | ((packing[8] & mask) as i32) << 16
-            | ((packing[9] & mask) as i32) << 24;
+        let n_m32 = (packing[6] & MASK) as i32
+            | ((packing[7] & MASK) as i32) << 8
+            | ((packing[8] & MASK) as i32) << 16
+            | ((packing[9] & MASK) as i32) << 24;
 
         let mut code_m32s = vec![0; n_m32 as usize];
         let mut decoder = GzDecoder::new(code_m32s);
@@ -605,7 +602,7 @@ impl CompressionDecoder for CodecDeflate {
         Ok(())
     }
 
-    fn decode_floats(&self, n_rows: i32, n_columns: i32, packing: &[i8]) -> Result<Vec<f32>> {
+    fn decode_floats(&self, _n_rows: i32, _n_columns: i32, _packing: &[i8]) -> Result<Vec<f32>> {
         Ok(Vec::default())
     }
 }
@@ -643,16 +640,18 @@ impl CompressionEncoder for CodecDeflate {
                 if !self.predictor[i].is_null_data_supported() {
                     continue;
                 }
-            } else {
-                if self.predictor[i].is_null_data_supported() {
-                    continue;
-                }
+            } else if self.predictor[i].is_null_data_supported() {
+                continue;
             }
 
             let m_code_length = self.predictor[i].encode(n_rows, n_cols, values, &mut m_code)?;
             if m_code_length > 0 {
-                let test_bytes =
-                    self.compress(codec_index, &self.predictor[i], &m_code, m_code_length)?;
+                let test_bytes = self.compress(
+                    codec_index,
+                    self.predictor[i].as_ref(),
+                    &m_code,
+                    m_code_length,
+                )?;
                 if !test_bytes.is_empty() && test_bytes.len() < result_length as usize {
                     result_length = test_bytes.len() as i32;
                     result_bytes = test_bytes;
@@ -664,7 +663,7 @@ impl CompressionEncoder for CodecDeflate {
     }
 
     fn encode_floats(
-        &self,
+        &mut self,
         _codec_index: i32,
         _n_rows: i32,
         _n_cols: i32,
@@ -686,7 +685,7 @@ impl CodecDeflate {
     fn compress(
         &self,
         codec_index: i32,
-        pcc: &Box<dyn PredictorModel>,
+        pcc: &dyn PredictorModel,
         m_codes: &[i8],
         n_m32: i32,
     ) -> Result<Vec<i8>> {
@@ -700,6 +699,8 @@ impl CodecDeflate {
                 .map(|i| *i as u8)
                 .collect::<Vec<_>>(),
         )?;
+
+        encoder.flush()?;
         deflator_result = encoder.finish()?;
 
         if d_n == 0 {
@@ -720,6 +721,284 @@ impl CodecDeflate {
         let mut b = vec![0; d_n + 10];
         b.copy_from_slice(&deflator_result[..]);
         Ok(b)
+    }
+}
+
+pub struct CodecFloat {
+    n_cells_in_tile: i32,
+    was_data_encoded: bool,
+    s_total: SimpleStats,
+    s_sign_bit: SimpleStats,
+    s_exp: SimpleStats,
+    s_m1_delta: SimpleStats,
+    s_m2_delta: SimpleStats,
+    s_m3_delta: SimpleStats,
+}
+
+impl CompressionEncoder for CodecFloat {
+    fn encode(
+        &mut self,
+        codec_index: i32,
+        n_rows: i32,
+        n_cols: i32,
+        values: &[i32],
+    ) -> Result<Vec<i8>> {
+        Err(Error::Compress(
+            "attempt to encode an integral format not supported by this CODEC".to_string(),
+        ))
+    }
+
+    fn encode_floats(
+        &mut self,
+        codec_index: i32,
+        n_rows: i32,
+        n_cols: i32,
+        values: &[f32],
+    ) -> Result<Vec<i8>> {
+        self.n_cells_in_tile = n_rows * n_cols;
+        self.was_data_encoded = true;
+
+        let mut c = vec![0; values.len()];
+        for (i, value) in values.iter().enumerate() {
+            c[1] = value.to_bits();
+        }
+        let mut b_sign = BitOutputStore::default();
+
+        todo!()
+    }
+
+    fn implements_floating_point_encoding(&self) -> bool {
+        todo!()
+    }
+
+    fn implements_integer_encoding(&self) -> bool {
+        todo!()
+    }
+}
+
+impl CompressionDecoder for CodecFloat {
+    fn decode(&mut self, n_rows: i32, n_columns: i32, packing: &[i8]) -> Result<Vec<i32>> {
+        Err(Error::Compress(
+            "attempt to decode an integral format not supported by this CODEC".to_string(),
+        ))
+    }
+
+    fn analyze(&mut self, n_rows: i32, n_columns: i32, packing: &[i8]) -> Result<()> {
+        self.n_cells_in_tile = n_rows * n_columns;
+        self.was_data_encoded = true;
+        let mut offset = 2;
+        let mut n = Self::unpack_integer(packing, offset);
+        self.s_sign_bit.add_count(n);
+        offset += 4 + n;
+
+        n = Self::unpack_integer(packing, offset);
+        self.s_exp.add_count(n);
+        offset += 4 + n;
+
+        n = Self::unpack_integer(packing, offset);
+        self.s_m1_delta.add_count(n);
+        offset += 4 + n;
+
+        n = Self::unpack_integer(packing, offset);
+        self.s_m2_delta.add_count(n);
+        offset += 4 + n;
+
+        n = Self::unpack_integer(packing, offset);
+        self.s_m3_delta.add_count(n);
+
+        self.s_total.add_count(packing.len() as i32);
+
+        Ok(())
+    }
+
+    fn report_analysis_data(&self, mut writer: impl Write, n_tiles_in_raster: i32) -> Result<()> {
+        if self.was_data_encoded {
+            let avg_bits_per_sample = self.s_total.avg_count() * 8.0 / self.n_cells_in_tile as f64;
+            let avg_bytes_per_sample = self.s_total.avg_count() / self.n_cells_in_tile as f64;
+
+            writer.write_str("Gridfour_float\n")?;
+            writer.write_str("   Average bytes per tile, by element        (Reduction)\n")?;
+            writer.write_fmt(format_args!(
+                "     Sign bits           {:.2}        ({:.4}%)\n",
+                self.s_sign_bit.avg_count(),
+                100.0 * self.s_sign_bit.avg_count() / (self.n_cells_in_tile * 8) as f64
+            ))?;
+            writer.write_fmt(format_args!(
+                "     Exponent            {:.2}        ({:.4}%)\n",
+                self.s_exp.avg_count(),
+                100.0 * self.s_exp.avg_count() / self.n_cells_in_tile as f64
+            ))?;
+            writer.write_fmt(format_args!(
+                "     Mantissa-1 delta    {:.2}        ({:.4}%)\n",
+                self.s_m1_delta.avg_count(),
+                100.0 * self.s_m1_delta.avg_count() / (7_f64 * self.n_cells_in_tile as f64 / 8_f64)
+            ))?;
+            writer.write_fmt(format_args!(
+                "     Mantissa-2 delta    {:.2}        ({:.4}%)\n",
+                self.s_m2_delta.avg_count(),
+                100.0 * self.s_m2_delta.avg_count() / self.n_cells_in_tile as f64
+            ))?;
+            writer.write_fmt(format_args!(
+                "     Mantissa-3 delta    {:.2}        ({:.4}%)\n",
+                self.s_m3_delta.avg_count(),
+                100.0 * self.s_m3_delta.avg_count() / self.n_cells_in_tile as f64
+            ))?;
+            writer.write_str("\n")?;
+            writer.write_fmt(format_args!(
+                "   Average Bytes/Tile   {:.2}        ({:.4}%)\n",
+                self.s_total.avg_count(),
+                100.0 * self.s_total.avg_count() / (self.n_cells_in_tile * 4) as f64
+            ))?;
+            writer.write_fmt(format_args!(
+                "   Average Bytes/Sample  {:.2}        ({:.4}%)\n",
+                avg_bytes_per_sample,
+                100.0 * avg_bytes_per_sample / 4_f64
+            ))?;
+
+            writer.write_fmt(format_args!(
+                "   Average Bits/Sample   {:.2}\n",
+                avg_bits_per_sample
+            ))?;
+        } else {
+            writer.write_str("Gridfour_Float (not used)\n")?;
+        }
+
+        Ok(())
+    }
+
+    fn clear_analysis_data(&mut self) -> Result<()> {
+        self.s_sign_bit.clear();
+        self.s_exp.clear();
+        self.s_m1_delta.clear();
+        self.s_m2_delta.clear();
+        self.s_m3_delta.clear();
+        self.s_total.clear();
+
+        Ok(())
+    }
+
+    fn decode_floats(&self, n_rows: i32, n_columns: i32, packing: &[i8]) -> Result<Vec<f32>> {
+        todo!()
+    }
+}
+
+impl CodecFloat {
+    fn pack_bytes(output: &mut [i8], offset: i32, sequence: &mut [i8]) -> i32 {
+        let sequence_length = sequence.len();
+        Self::pack_integer(output, offset, sequence.len() as i32);
+        output[(offset + 4) as usize..].copy_from_slice(&sequence[0..sequence_length]);
+        offset + sequence_length as i32 + 4
+    }
+
+    fn pack_integer(output: &mut [i8], offset: i32, i_value: i32) -> i32 {
+        output[offset as usize] = (i_value & MASK as i32) as i8;
+        output[(offset + 1) as usize] = ((i_value >> 8) & MASK as i32) as i8;
+        output[(offset + 2) as usize] = ((i_value >> 16) & MASK as i32) as i8;
+        output[(offset + 3) as usize] = ((i_value >> 24) & MASK as i32) as i8;
+        offset + 4
+    }
+
+    fn unpack_integer(input: &[i8], offset: i32) -> i32 {
+        ((input[offset as usize] & MASK) as i32)
+            | ((input[(offset + 1) as usize] & MASK) as i32) << 8
+            | ((input[(offset + 2) as usize] & MASK) as i32) << 16
+            | ((input[(offset + 2) as usize] & MASK) as i32) << 24
+    }
+
+    fn do_deflate(input: &[i8], stats: &mut SimpleStats) -> Result<Vec<i8>> {
+        let mut result_b = vec![0; input.len() + 128_usize];
+        let result_b_len = result_b.len();
+        let mut encoder = GzEncoder::new(result_b, Compression::new(6));
+        let db = encoder.write(
+            &input[..result_b_len]
+                .iter()
+                .map(|i| *i as u8)
+                .collect::<Vec<_>>(),
+        )?;
+        encoder.flush()?;
+        result_b = encoder.finish()?;
+        stats.add_count(db as i32);
+        if db == 0 {
+            return Err(Error::Compress("deflate failed".to_string()));
+        }
+
+        let mut b = vec![0_i8; db];
+        b[..result_b_len].copy_from_slice(&result_b.iter().map(|i| *i as i8).collect::<Vec<_>>());
+        Ok(b)
+    }
+
+    fn do_inflate(
+        input: &[i8],
+        offset: i32,
+        length: i32,
+        output: &mut [u8],
+        output_length: i32,
+    ) -> Result<i32> {
+        let mut decoder = GzDecoder::new(output);
+        let test = decoder.write(
+            &input[..output_length as usize]
+                .iter()
+                .map(|i| *i as u8)
+                .collect::<Vec<_>>(),
+        )?;
+        if test == 0 {
+            return Err(Error::Compress("inflate failed".to_string()));
+        }
+
+        Ok(test as i32)
+    }
+
+    fn encode_deltas(scratch: &mut [i8], n_rows: i32, n_columns: i32) {
+        let mut prior0 = 0_i32;
+        let mut test: i32;
+        let mut k = 0;
+        for _ in 0..n_rows {
+            let mut prior = prior0;
+            prior0 = scratch[k] as i32;
+            for _ in 0..n_columns {
+                test = scratch[k] as i32;
+                scratch[k] = (test - prior as i32) as i8;
+                k += 1;
+                prior = test;
+            }
+        }
+    }
+
+    fn decode_deltas(scratch: &mut [i8], n_rows: i32, n_columns: i32) {
+        let mut prior = 0_i32;
+        let mut k = 0;
+        for irow in 0..n_rows {
+            for _ in 0..n_columns {
+                prior += scratch[k] as i32;
+                scratch[k] = prior as i8;
+                k += 1;
+            }
+            prior = scratch[(irow * n_columns) as usize] as i32;
+        }
+    }
+}
+struct SimpleStats {
+    n_sum: i32,
+    sum: i64,
+}
+
+impl SimpleStats {
+    fn add_count(&mut self, counts: i32) {
+        self.sum += counts as i64;
+        self.n_sum += 1;
+    }
+
+    fn avg_count(&self) -> f64 {
+        if self.n_sum == 0 {
+            return 0_f64;
+        }
+
+        self.sum as f64 / self.n_sum as f64
+    }
+
+    fn clear(&mut self) {
+        self.n_sum = 0;
+        self.sum = 0;
     }
 }
 
