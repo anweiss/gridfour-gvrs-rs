@@ -1258,7 +1258,7 @@ impl PredictorModel for PredictorModelLinear {
         let mut prior = seed as i64;
         output[0] = seed;
         output[1] = (m_codec.decode() as i64 + prior) as i32;
-        for i in 0..n_rows {
+        for i in 1..n_rows {
             let index = i * n_columns;
             let test = m_codec.decode() as i64 + prior;
             output[index as usize] = test as i32;
@@ -1705,6 +1705,55 @@ mod tests {
                 instance.is_null_data_supported(),
                 "implementation does not support null data"
             );
+
+            let encoded_length = instance
+                .encode(n_rows, n_columns, &values, &mut encoding)
+                .unwrap();
+            let seed = instance.seed();
+
+            let mut decoding = vec![0; values.len()];
+
+            instance
+                .decode(
+                    seed,
+                    n_rows,
+                    n_columns,
+                    &encoding,
+                    0,
+                    encoded_length,
+                    &mut decoding,
+                )
+                .unwrap();
+
+            for (i, d) in decoding.iter().enumerate() {
+                assert_eq!(
+                    *d, values[i],
+                    "failure to decode at index {}, input={}, output={}",
+                    i, values[i], d
+                );
+            }
+        }
+    }
+
+    mod predictor_model_linear {
+        use super::*;
+
+        #[test]
+        fn round_trip() {
+            let n_rows = 10;
+            let n_columns = 10;
+            let mut values = vec![0; (n_rows * n_columns) as usize];
+            for i_row in 0..n_rows {
+                let offset = i_row * n_columns;
+                let mut v = i_row;
+                for i_col in (0..10).step_by(2) {
+                    values[(offset + i_col) as usize] = v;
+                    v += 1;
+                }
+            }
+
+            let mut encoding = vec![0; (n_rows * n_columns * 6) as usize];
+            let mut instance = PredictorModelLinear::default();
 
             let encoded_length = instance
                 .encode(n_rows, n_columns, &values, &mut encoding)
