@@ -6,7 +6,10 @@ use flate2::{
 };
 use thiserror::Error;
 
-use crate::{io::BitOutputStore, INT4_NULL_CODE};
+use crate::{
+    io::{self, BitInputStore, BitOutputStore},
+    INT4_NULL_CODE,
+};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -18,6 +21,8 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("fmt error {0}")]
     Fmt(#[from] std::fmt::Error),
+    #[error("io error {0}")]
+    GvrsIo(#[from] io::Error),
 }
 
 const MASK: i8 = 0xff_u8 as i8;
@@ -53,7 +58,7 @@ pub trait CompressionDecoder {
 
     fn clear_analysis_data(&mut self) -> Result<()>;
 
-    fn decode_floats(&self, n_rows: i32, n_columns: i32, packing: &[i8]) -> Result<Vec<f32>>;
+    fn decode_floats(&mut self, n_rows: i32, n_columns: i32, packing: &[i8]) -> Result<Vec<f32>>;
 }
 
 pub trait PredictorModel {
@@ -312,8 +317,7 @@ impl CodecM32 {
     }
 
     pub fn encode(&mut self, value: i32) {
-        #[allow(unused_assignments)]
-        let mut abs_value = 0;
+        let abs_value: i32;
 
         if value < 0 {
             if value == i32::MIN {
@@ -325,6 +329,7 @@ impl CodecM32 {
                 self.offset += 1;
                 return;
             }
+
             self.buffer[self.offset as usize] = -127_i8;
             self.offset += 1;
             abs_value = -value;
@@ -433,10 +438,10 @@ impl Default for CodecDeflate {
     fn default() -> Self {
         CodecDeflate {
             predictor: vec![
-                Box::new(PredictorModelDifferencing::default()),
-                Box::new(PredictorModelLinear::default()),
-                Box::new(PredictorModelTriangle::default()),
-                Box::new(PredictorModelDifferencingWithNulls::default()),
+                Box::<PredictorModelDifferencing>::default(),
+                Box::<PredictorModelLinear>::default(),
+                Box::<PredictorModelTriangle>::default(),
+                Box::<PredictorModelDifferencingWithNulls>::default(),
             ],
             codec_stats: Vec::default(),
         }
@@ -467,7 +472,7 @@ impl CompressionDecoder for CodecDeflate {
         if test > 0 {
             let mut output = vec![0; (n_rows * n_columns) as usize];
 
-            match PredictorModelType::from(packing[1] as i8) {
+            match PredictorModelType::from(packing[1]) {
                 PredictorModelType::Differencing => {
                     let pcc = PredictorModelDifferencing::default();
                     pcc.decode(
@@ -602,7 +607,12 @@ impl CompressionDecoder for CodecDeflate {
         Ok(())
     }
 
-    fn decode_floats(&self, _n_rows: i32, _n_columns: i32, _packing: &[i8]) -> Result<Vec<f32>> {
+    fn decode_floats(
+        &mut self,
+        _n_rows: i32,
+        _n_columns: i32,
+        _packing: &[i8],
+    ) -> Result<Vec<f32>> {
         Ok(Vec::default())
     }
 }
@@ -760,19 +770,70 @@ impl CompressionEncoder for CodecFloat {
 
         let mut c = vec![0; values.len()];
         for (i, value) in values.iter().enumerate() {
-            c[1] = value.to_bits();
+            c[i] = value.to_bits();
         }
         let mut b_sign = BitOutputStore::default();
 
-        todo!()
+        for c in c.iter() {
+            let bit = (*c as i32 >> 31) & 1;
+            b_sign.append_bit(bit);
+        }
+
+        let mut comp_sign_bit =
+            CodecFloat::do_deflate(&b_sign.encoded_text(), &mut self.s_sign_bit)?;
+        let mut scratch = vec![0_i8; c.len()];
+        for (i, c) in c.iter().enumerate() {
+            scratch[i] = ((*c as i32 >> 23) & 0xff) as i8;
+        }
+
+        let mut comp_exp = CodecFloat::do_deflate(&scratch, &mut self.s_exp)?;
+
+        for (i, c) in c.iter().enumerate() {
+            scratch[i] = ((*c as i32 >> 16) & 0x7f) as i8;
+        }
+        CodecFloat::encode_deltas(&mut scratch, n_rows, n_cols);
+        let mut comp_m1 = CodecFloat::do_deflate(&scratch, &mut self.s_m1_delta)?;
+
+        for (i, c) in c.iter().enumerate() {
+            scratch[i] = ((*c as i32 >> 8) & 0xff) as i8;
+        }
+        CodecFloat::encode_deltas(&mut scratch, n_rows, n_cols);
+        let mut comp_m2 = CodecFloat::do_deflate(&scratch, &mut self.s_m2_delta)?;
+
+        for (i, c) in c.iter().enumerate() {
+            scratch[i] = ((*c as i32) & 0xff) as i8;
+        }
+        CodecFloat::encode_deltas(&mut scratch, n_rows, n_cols);
+        let mut comp_m3 = CodecFloat::do_deflate(&scratch, &mut self.s_m3_delta)?;
+
+        let n_packed =
+            comp_sign_bit.len() + comp_exp.len() + comp_m1.len() + comp_m2.len() + comp_m3.len();
+
+        let mut packing = vec![0_i8; n_packed + 2 + 5 * 4];
+        self.s_total.add_count(packing.len() as i32);
+
+        packing[0] = codec_index as i8;
+        packing[1] = 0_i8;
+        let mut offset = 2_i32;
+        offset = CodecFloat::pack_bytes(&mut packing, offset, &mut comp_sign_bit);
+        offset = CodecFloat::pack_bytes(&mut packing, offset, &mut comp_exp);
+        offset = CodecFloat::pack_bytes(&mut packing, offset, &mut comp_m1);
+        offset = CodecFloat::pack_bytes(&mut packing, offset, &mut comp_m2);
+        offset = CodecFloat::pack_bytes(&mut packing, offset, &mut comp_m3);
+
+        if offset != packing.len() as i32 {
+            return Err(Error::Compress("incorrect packing".to_string()));
+        }
+
+        Ok(packing)
     }
 
     fn implements_floating_point_encoding(&self) -> bool {
-        todo!()
+        true
     }
 
     fn implements_integer_encoding(&self) -> bool {
-        todo!()
+        false
     }
 }
 
@@ -877,8 +938,99 @@ impl CompressionDecoder for CodecFloat {
         Ok(())
     }
 
-    fn decode_floats(&self, n_rows: i32, n_columns: i32, packing: &[i8]) -> Result<Vec<f32>> {
-        todo!()
+    fn decode_floats(&mut self, n_rows: i32, n_columns: i32, packing: &[i8]) -> Result<Vec<f32>> {
+        self.n_cells_in_tile = n_rows * n_columns;
+        let mut scratch = vec![0_i8; self.n_cells_in_tile as usize];
+        let mut raw_int = vec![0_i32; self.n_cells_in_tile as usize];
+        let mut f = vec![0_f32; self.n_cells_in_tile as usize];
+        let n_sign_bytes = (self.n_cells_in_tile + 7) / 8;
+
+        let mut offset = 2_i32;
+        let mut n = CodecFloat::unpack_integer(packing, offset);
+        offset += 4;
+        CodecFloat::do_inflate(
+            packing,
+            offset,
+            n,
+            &mut scratch.iter().map(|s| *s as u8).collect::<Vec<_>>(),
+            n_sign_bytes,
+        )?;
+        let mut bins = BitInputStore::new(&scratch);
+        let mut sign_bit: i32;
+        for i in 0..self.n_cells_in_tile {
+            sign_bit = bins.bit()?;
+            raw_int[i as usize] = sign_bit << 31;
+        }
+        offset += n;
+
+        n = CodecFloat::unpack_integer(packing, offset);
+        offset += 4;
+        CodecFloat::do_inflate(
+            packing,
+            offset,
+            n,
+            &mut scratch.iter().map(|s| *s as u8).collect::<Vec<_>>(),
+            self.n_cells_in_tile,
+        )?;
+        for i in 0..self.n_cells_in_tile {
+            raw_int[i as usize] |= (scratch[i as usize] as i32 & 0xff) << 23;
+        }
+        offset += n;
+
+        n = CodecFloat::unpack_integer(packing, offset);
+        offset += 4;
+        CodecFloat::do_inflate(
+            packing,
+            offset,
+            n,
+            &mut scratch.iter().map(|s| *s as u8).collect::<Vec<_>>(),
+            self.n_cells_in_tile,
+        )?;
+        CodecFloat::decode_deltas(&mut scratch, n_rows, n_columns);
+        for i in 0..self.n_cells_in_tile {
+            raw_int[i as usize] |= (scratch[i as usize] as i32 & 0x7f) << 16;
+        }
+        offset += n;
+
+        n = CodecFloat::unpack_integer(packing, offset);
+        offset += 4;
+        CodecFloat::do_inflate(
+            packing,
+            offset,
+            n,
+            &mut scratch.iter().map(|s| *s as u8).collect::<Vec<_>>(),
+            self.n_cells_in_tile,
+        )?;
+        CodecFloat::decode_deltas(&mut scratch, n_rows, n_columns);
+        for i in 0..self.n_cells_in_tile {
+            raw_int[i as usize] |= (scratch[i as usize] as i32 & 0xff) << 8;
+        }
+        offset += n;
+
+        n = CodecFloat::unpack_integer(packing, offset);
+        offset += 4;
+        CodecFloat::do_inflate(
+            packing,
+            offset,
+            n,
+            &mut scratch.iter().map(|s| *s as u8).collect::<Vec<_>>(),
+            self.n_cells_in_tile,
+        )?;
+        CodecFloat::decode_deltas(&mut scratch, n_rows, n_columns);
+        for i in 0..self.n_cells_in_tile {
+            raw_int[i as usize] |= scratch[i as usize] as i32 & 0xff;
+        }
+        offset += n;
+
+        if offset != packing.len() as i32 {
+            return Err(Error::Compress("incorrect packing".to_string()));
+        }
+
+        for i in 0..self.n_cells_in_tile {
+            f[i as usize] = f32::from_bits(raw_int[i as usize] as u32);
+        }
+
+        Ok(f)
     }
 }
 
@@ -932,11 +1084,11 @@ impl CodecFloat {
         offset: i32,
         length: i32,
         output: &mut [u8],
-        output_length: i32,
+        _output_length: i32,
     ) -> Result<i32> {
         let mut decoder = GzDecoder::new(output);
         let test = decoder.write(
-            &input[..output_length as usize]
+            &input[offset as usize..length as usize]
                 .iter()
                 .map(|i| *i as u8)
                 .collect::<Vec<_>>(),
@@ -957,7 +1109,7 @@ impl CodecFloat {
             prior0 = scratch[k] as i32;
             for _ in 0..n_columns {
                 test = scratch[k] as i32;
-                scratch[k] = (test - prior as i32) as i8;
+                scratch[k] = (test - prior) as i8;
                 k += 1;
                 prior = test;
             }
@@ -1142,8 +1294,8 @@ impl PredictorModel for PredictorModelLinear {
         let mut m_codec = CodecM32::new(encoding, 0, encoding.len() as i32);
         self.encoded_seed = values[0];
 
-        let mut delta = 0_i64;
-        let mut test = 0_i64;
+        let mut delta: i64;
+        let mut test: i64;
         let mut prior = values[0] as i64;
         delta = values[1] as i64 - prior;
         m_codec.encode(delta as i32);
@@ -1172,6 +1324,8 @@ impl PredictorModel for PredictorModelLinear {
                 b = c as i64;
             }
         }
+
+        encoding.copy_from_slice(&m_codec.buffer);
 
         Ok(m_codec.encoded_length())
     }
@@ -1280,6 +1434,8 @@ impl PredictorModel for PredictorModelTriangle {
             }
         }
 
+        encoding.copy_from_slice(&m_codec.buffer);
+
         Ok(m_codec.encoded_length())
     }
 
@@ -1327,6 +1483,7 @@ impl PredictorModel for PredictorModelDifferencingWithNulls {
                 if test == PredictorModelDifferencingWithNulls::NULL_DATA_CODE {
                     null_flag = true;
                     output[index as usize] = PredictorModelDifferencingWithNulls::NULL_DATA_CODE;
+
                     index += 1;
                 } else {
                     if null_flag {
@@ -1378,10 +1535,13 @@ impl PredictorModel for PredictorModelDifferencingWithNulls {
         if n_start == 0 {
             return Ok(0_i32);
         }
+
         let avg_start = sum_start as f64 / n_start as f64;
+
         self.encoded_seed = (avg_start + 0.5).floor() as i32;
 
         let mut prior = self.encoded_seed as i64;
+
         null_flag = false;
         for i in 0..n_rows {
             let mut index = i * n_columns;
@@ -1404,6 +1564,8 @@ impl PredictorModel for PredictorModelDifferencingWithNulls {
             prior = values[(i * n_columns) as usize] as i64;
             null_flag = prior == PredictorModelDifferencingWithNulls::NULL_DATA_CODE as i64;
         }
+
+        output.copy_from_slice(&m_codec.buffer);
 
         Ok(m_codec.encoded_length())
     }
@@ -1488,6 +1650,61 @@ mod tests {
 
             let mut encoding = vec![0; (n_rows * n_columns * 6) as usize];
             let mut instance = PredictorModelDifferencing::default();
+
+            let encoded_length = instance
+                .encode(n_rows, n_columns, &values, &mut encoding)
+                .unwrap();
+            let seed = instance.seed();
+
+            let mut decoding = vec![0; values.len()];
+
+            instance
+                .decode(
+                    seed,
+                    n_rows,
+                    n_columns,
+                    &encoding,
+                    0,
+                    encoded_length,
+                    &mut decoding,
+                )
+                .unwrap();
+
+            for (i, d) in decoding.iter().enumerate() {
+                assert_eq!(
+                    *d, values[i],
+                    "failure to decode at index {}, input={}, output={}",
+                    i, values[i], d
+                );
+            }
+        }
+    }
+
+    mod predictor_model_differencing_with_nulls {
+        use super::*;
+
+        #[test]
+        fn round_trip() {
+            let n_rows = 10;
+            let n_columns = 10;
+            let mut values = vec![0_i32; (n_rows * n_columns) as usize];
+            for i_row in 0..n_rows {
+                let offset = i_row * n_columns;
+                let mut v = i_row;
+                for i_col in (0..10).step_by(2) {
+                    values[(offset + i_col) as usize] = v;
+                    v += 1;
+                }
+                values[(offset + i_row) as usize] = i32::MIN;
+            }
+
+            let mut encoding = vec![0; (n_rows * n_columns * 6) as usize];
+            let mut instance = PredictorModelDifferencingWithNulls::default();
+
+            assert!(
+                instance.is_null_data_supported(),
+                "implementation does not support null data"
+            );
 
             let encoded_length = instance
                 .encode(n_rows, n_columns, &values, &mut encoding)
